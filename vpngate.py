@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -37,13 +37,27 @@ for _stream in (sys.stdout, sys.stderr):
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
 VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
+VPNGATE_API_HTTPS = os.environ.get("VPNGATE_API_HTTPS", "https://www.vpngate.net/api/iphone/")
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
+# 数据源候选(按顺序逐个尝试, 任一成功即用); type: csv=官方CSV, json=镜像JSON
+# 首选 GitHub 镜像: Runner 访问 raw.githubusercontent 必然快且稳; 官方源在部分网络下会挂起, 作为兜底。
+VPNGATE_SOURCES = [
+    {"url": VPNGATE_MIRROR, "type": "json", "label": "GitHub镜像"},
+    {"url": VPNGATE_API, "type": "csv", "label": "官方API(http)"},
+    {"url": VPNGATE_API_HTTPS, "type": "csv", "label": "官方API(https)"},
+]
+# 单个数据源整体硬截止(秒): 官方源挂起时 requests 的 read-timeout 可能不生效导致永久等待,
+# 这里用子线程 + future.result(timeout) 做强制总时长上限, 到点即放弃该源并换下一个。
+FETCH_CONNECT_TIMEOUT = float(os.environ.get("FETCH_CONNECT_TIMEOUT", "10"))
+FETCH_READ_TIMEOUT = float(os.environ.get("FETCH_READ_TIMEOUT", "20"))
+FETCH_TOTAL_TIMEOUT = float(os.environ.get("FETCH_TOTAL_TIMEOUT", "25"))
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://zz.yojobjob1.ccwu.cc/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+CHECK_BUDGET = float(os.environ.get("CHECK_BUDGET", "480"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -117,30 +131,55 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # 数据抓取
 # ---------------------------------------------------------------------------
-def fetch_vpngate():
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+def _http_get_hard(url, parser):
+    """子线程内请求, 用 future.result(timeout) 做整体硬截止; 超时立即放弃本源。"""
+    box = {}
 
-    try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+    def _work():
+        resp = requests.get(
+            url,
+            timeout=(FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
+        )
         resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
-    except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
+        box["rows"] = parser(resp)
+
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(_work)
+    try:
+        fut.result(timeout=FETCH_TOTAL_TIMEOUT)
+    finally:
+        # 不等待挂起的后台线程, 主流程立即继续换下一个源
+        ex.shutdown(wait=False)
+    return box["rows"]
+
+
+def fetch_vpngate():
+    last_err = None
+    for src in VPNGATE_SOURCES:
+        url, stype, label = src["url"], src["type"], src["label"]
+        if not url:
+            continue
+        try:
+            log("VPN GATE", f"尝试数据源[{label}]: {url} (整体上限 {FETCH_TOTAL_TIMEOUT:.0f}s)")
+            if stype == "csv":
+                rows = _http_get_hard(url, lambda r: parse_csv(r.text))
+                source = "vpngate.net/api/iphone"
+            else:
+                rows = _http_get_hard(url, lambda r: parse_mirror_json(r.json()))
+                source = "github-mirror"
+            if rows:
+                log("VPN GATE", f"数据源[{label}] 获取到 {len(rows)} 个原始节点")
+                return rows, source
+            last_err = f"[{label}] 返回 0 行数据"
+            log("VPN GATE", last_err)
+        except FutTimeout:
+            last_err = f"[{label}] 超过 {FETCH_TOTAL_TIMEOUT:.0f}s 整体上限, 已放弃"
+            log("VPN GATE", last_err)
+        except Exception as exc:
+            last_err = f"[{label}] {type(exc).__name__}: {exc}"
+            log("VPN GATE", f"数据源[{label}] 失败: {last_err}")
+    die(f"VPN Gate 全部数据源均不可用, 最后错误: {last_err}")
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -372,9 +411,28 @@ def check_one(node, session):
 def check_all(nodes, session):
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
-        for fut in as_completed(futures):
-            results.append(fut.result())
+        futures = {pool.submit(check_one, n, session): n for n in nodes}
+        pending = set(futures)
+        try:
+            for fut in as_completed(futures, timeout=CHECK_BUDGET):
+                pending.discard(fut)
+                results.append(fut.result())
+        except FutTimeout:
+            log("CLOUDFLARE WORKER", f"检测整体预算 {CHECK_BUDGET:.0f}s 用尽, 剩余 {len(pending)} 个节点按失败处理")
+        for fut in pending:
+            n = futures[fut]
+            results.append({
+                **n,
+                "protocol": "sstp",
+                "link": f"sstp://vpn:vpn@{n['host']}:{n['port']}",
+                "status": "failed",
+                "success": False,
+                "checked_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                "exit": None,
+                "residential": "unknown",
+                "error": f"budget-timeout >{CHECK_BUDGET:.0f}s",
+                "worker_error": True,
+            })
     return results
 
 # ---------------------------------------------------------------------------
