@@ -36,7 +36,13 @@ jobs:
           # 已部署的检测 Worker (不要改动: 检测统一走这里)
           CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+          CHECK_TIMEOUT: "25"
+          # 数据源整体硬截止(秒): 官方源挂起时到点即放弃并切换到下一源/镜像, 不再永久等待
+          FETCH_CONNECT_TIMEOUT: "10"
+          FETCH_READ_TIMEOUT: "20"
+          FETCH_TOTAL_TIMEOUT: "25"
+          # 检测阶段整体预算(秒), 超时后剩余节点按失败处理, 避免拖到 job 30 分钟上限
+          CHECK_BUDGET: "480"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
